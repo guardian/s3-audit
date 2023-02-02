@@ -11,7 +11,10 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/accessanalyzer"
+	"github.com/aws/aws-sdk-go-v2/service/accessanalyzer/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"golang.org/x/exp/slices"
 )
 
 func main() {
@@ -68,15 +71,60 @@ func main() {
 	buckets, err := client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	check(err, "unable to list buckets")
 
+	aaClient := accessanalyzer.NewFromConfig(config)
+
+	accessAnalyzerPublicBuckets := getAccessAnalyzerPublicBuckets(aaClient)
+	log.Println("aa buckets: ", accessAnalyzerPublicBuckets)
+
 	for _, bucket := range buckets.Buckets {
-		if canGetObject(client, *bucket.Name) {
-			fmt.Printf("%-60s\tpublic", *bucket.Name)
-		} else {
-			fmt.Printf("%-60s\tprivate", *bucket.Name)
+		isPublic := canGetObject(client, *bucket.Name)
+		isAWSPublic := slices.Contains(accessAnalyzerPublicBuckets, *bucket.Name)
+
+		if isPublic || isAWSPublic {
+			fmt.Printf("%-60s\t(public: %v, awspublic: %v)\n", *bucket.Name, isPublic, isAWSPublic)
+		}
+	}
+}
+
+func getAccessAnalyzerPublicBuckets(client *accessanalyzer.Client) []string {
+	ctx := context.TODO()
+
+	analyzers, err := client.ListAnalyzers(ctx, &accessanalyzer.ListAnalyzersInput{})
+	if err != nil {
+		log.Printf("unable to list analysers: %v\n", err)
+		return []string{}
+	}
+
+	if len(analyzers.Analyzers) < 1 {
+		log.Println("no analysers found in account")
+		return []string{}
+	}
+
+	analyzer := analyzers.Analyzers[0] // just take first - we assume this is the console one
+
+	paginator := accessanalyzer.NewListFindingsPaginator(client, &accessanalyzer.ListFindingsInput{
+		AnalyzerArn: analyzer.Arn,
+		Filter: map[string]types.Criterion{
+			"resourceType": {Eq: []string{"AWS::S3::Bucket"}},
+			"isPublic":     {Eq: []string{"true"}},
+		},
+	})
+
+	buckets := []string{}
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			log.Printf("pagination error for list findings: %v", err)
+			continue
 		}
 
-		println()
+		for _, finding := range page.Findings {
+			bucketName := strings.TrimPrefix(*finding.Resource, "arn:aws:s3:::")
+			buckets = append(buckets, bucketName)
+		}
 	}
+
+	return buckets
 }
 
 func canGetObject(client *s3.Client, bucketName string) bool {
